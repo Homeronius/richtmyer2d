@@ -29,33 +29,32 @@ def isentropic_vortex_ic(xx_spacing, yy_spacing, gamma, epsilon):
 
     return np.multiply(v_phi, xx_spacing), np.multiply(v_phi, yy_spacing), p
 
-def internal_energy(p, velocity, rho, gamma, epsilon):
+def total_cell_energy(p, velocity, rho, gamma):
     vel_norm = np.linalg.norm(velocity, axis=-1)
-    return p / (gamma-1.0) + 0.5 * epsilon * epsilon * np.multiply(rho, vel_norm**2)
+    return p / (gamma - 1.0) + 0.5 * np.multiply(rho, vel_norm**2)
+
+def primitive_vars(q, gamma):
+    u = q[..., 1]/q[..., 0]
+    v = q[..., 2]/q[..., 0]
+    e = q[..., 3]
+
+    vel_norm = np.linalg.norm(np.stack([u,v], axis=-1), axis=-1)
+
+    # Internal Energy
+    e_internal = e - 0.5 * q[..., 0] * vel_norm**2
+    p = (gamma - 1.0) * e_internal
+
+    return u, v, e, p
 
 # Vector-valued flux in x-direction
 def F(q, gamma):
-    u = q[..., 1]/q[..., 0]
-    v = q[..., 2]/q[..., 0]
-    e = q[..., 3]/q[..., 0]
+    u, _, e, p = primitive_vars(q, gamma)
+    return np.stack([q[..., 1], p+u*q[..., 1], u*q[..., 2], u*(e + p)], axis=-1)
 
-    vel_norm = np.linalg.norm(np.stack([u,v], axis=-1), axis=-1)
-    # Internal Energy
-    e_internal = q[..., 3] - 0.5 * q[..., 0] * vel_norm**2
-    p = (gamma - 1.0) * e_internal
-    return np.stack([q[..., 1], p+u*q[..., 1], u*q[..., 2], q[..., 1]*e + p*u], axis=-1)
-
-# Vector-valued flux in x-direction
+# Vector-valued flux in y-direction
 def G(q, gamma):
-    u = q[..., 1]/q[..., 0]
-    v = q[..., 2]/q[..., 0]
-    e = q[..., 3]/q[..., 0]
-
-    vel_norm = np.linalg.norm(np.stack([u,v], axis=-1), axis=-1)
-    # Internal Energy
-    e_internal = q[..., 3] - 0.5 * q[..., 0] * vel_norm**2
-    p = (gamma - 1.0) * e_internal
-    return np.stack([q[..., 1], q[..., 1]*v, p+v*q[..., 2], q[..., 2]*e + p*v], axis=-1)
+    _, v, e, p = primitive_vars(q, gamma)
+    return np.stack([q[..., 2], v*q[..., 1], p+v*q[..., 2], v*(e + p)], axis=-1)
 
 class Grid:
     def __init__(self, x_range, y_range, gamma, epsilon, cells_per_dim, halo_size):
@@ -68,19 +67,24 @@ class Grid:
         xx_spacing -= 0.5
         yy_spacing -= 0.5
 
-        # Enforce initial conditions
-        self.center_idx = np.s_[halo_size:-halo_size]
-        self.halo_size = halo_size
-        self.dim_tot = cells_per_dim + 2*halo_size
+        # Index helpers for shifted grids
+        self.ds = 2*halo_size
+        self.hs = halo_size
+        self.center_idx = np.s_[self.hs:-self.hs]
+        self.plus_idx = np.s_[self.ds:]
+        self.minus_idx = np.s_[:-self.ds]
+
+        self.dim_tot = cells_per_dim + 2*self.hs
         self.gamma = gamma
 
+        # Enforce initial conditions
         u_init, v_init, p_init = isentropic_vortex_ic(xx_spacing,
                                                       yy_spacing,
                                                       gamma,
                                                       epsilon)
         rho_init = np.ones_like(u_init)
         velocity = np.stack([u_init, v_init], axis=-1)
-        e_init = internal_energy(p_init, velocity, rho_init, gamma, epsilon)
+        e_init = total_cell_energy(p_init, velocity, rho_init, gamma)
 
         self.q = np.empty((self.dim_tot, self.dim_tot, 4))
         self.p = np.empty((self.dim_tot, self.dim_tot))
@@ -133,17 +137,26 @@ class Grid:
 
     # Return view, potentially also boundary in one directionj
     def get_q_inner(self, shift=None):
-        ds = 2*self.halo_size
         if shift == 'top':
-            return self.q[self.center_idx, :-ds, :]
+            return self.q[self.minus_idx, self.center_idx, :]
+        elif shift == 'topright':
+            return self.q[self.minus_idx, self.plus_idx, :]
+        elif shift == 'topleft':
+            return self.q[self.minus_idx, self.minus_idx, :]
         elif shift == 'right':
-            return self.q[ds:, self.center_idx, :]
+            return self.q[self.center_idx, self.plus_idx, :]
+        elif shift == 'bottomright':
+            return self.q[self.plus_idx, self.plus_idx, :]
         elif shift == 'bottom':
-            return self.q[self.center_idx, ds:, :]
+            return self.q[self.plus_idx, self.center_idx, :]
+        elif shift == 'bottomleft':
+            return self.q[self.plus_idx, self.minus_idx, :]
         elif shift == 'left':
-            return self.q[:-ds, self.center_idx, :]
-        else:
+            return self.q[self.center_idx, self.minus_idx, :]
+        elif shift is None or 'center':
             return self.q[self.center_idx, self.center_idx, :]
+        else:
+            raise ValueError('Shift type not known.')
 
     def set_q_inner(self, q_new):
         self.q[self.center_idx, self.center_idx, :] = q_new
@@ -155,23 +168,29 @@ class Grid:
         return G(self.get_q_inner(shift), self.gamma)
 
     def enforce_periodic_bc(self):
+        # Update Pressure
+        _, _, _, p = primitive_vars(self.get_q_inner(), self.gamma)
+        if np.array_equal(p, self.p[self.center_idx, self.center_idx]):
+            print('Should be equal in the first step!!!!')
+        self.p[self.center_idx, self.center_idx] = p
+
         # x-dim
-        left_bdry = self.q[1, :, :]
-        self.q[0,...] = self.q[-2, :,:]
-        self.q[-1,...] = left_bdry
+        bottom_bdry = self.q[:, self.hs:self.ds, :]
+        self.q[:, :self.hs, :] = self.q[:, -self.ds:-self.hs, :]
+        self.q[:, -self.hs:, :] = bottom_bdry
+
+        bottom_p = self.p[:, self.hs:self.ds]
+        self.p[:, :self.hs] = self.p[:, -self.ds:-self.hs]
+        self.p[:,-self.hs:] = bottom_p
         
-        left_p = self.p[1, :]
-        self.p[0, :] = self.p[-2, :]
-        self.p[-1,:] = left_p
-
         # y-dim
-        bottom_bdry = self.q[:, 1, :]
-        self.q[:, 0, :] = self.q[-2, :, :]
-        self.q[:, -1, :] = bottom_bdry
-
-        bottom_p = self.p[1, :]
-        self.p[:, 0] = self.p[:, -2]
-        self.p[:,-1] = bottom_p
+        left_bdry = self.q[self.hs:self.ds, :, :]
+        self.q[:self.hs, :] = self.q[-self.ds:-self.hs, :,:]
+        self.q[-self.hs, :] = left_bdry
+        
+        left_p = self.p[self.hs:self.ds, :]
+        self.p[:self.hs, :] = self.p[-self.ds:-self.hs, :]
+        self.p[-self.hs:,:] = left_p
 
 
 def main():
@@ -180,12 +199,12 @@ def main():
     epsilon = 1e-2
 
     # CFL Number
-    cfl = 0.45
+    cfl = 0.95
 
     x_range = [0.0, 1.0]
     y_range = [0.0, 1.0]
 
-    cells_per_dim = 100
+    cells_per_dim = 50
     halo_size = 1
     dx = (x_range[1] - x_range[0]) / cells_per_dim
     dy = (y_range[1] - y_range[0]) / cells_per_dim
@@ -194,62 +213,120 @@ def main():
 
     # Evolution with 2D Richtmyer scheme
     t = 0.0
-    t_end = 1.0
+    t_end = 0.1
 
     # Satisfy CFL condition
     rho = g.get_rho_inner()
-    u = g.get_rho_u_inner()/rho
-    v = g.get_rho_v_inner()/rho
-    p = g.get_p_inner()
+    u, v, _, p = primitive_vars(g.get_q_inner(), gamma)
     
     velocity = np.stack([u,v], axis=-1)
     # Sound speed
     c = np.sqrt(gamma * p / rho)
     max_vel = np.max(np.abs(velocity), axis=-1)
-    dt = 0.5 * dx / np.max(max_vel + c)
-    print(dt)
-
+    dt = cfl * min(dx, dy) / np.max(max_vel + c)
+    print(f'dt = {dt}')
 
     img_list = []
     fig, ax = plt.subplots()
 
+    print_ctr = 0
     while t < t_end:
-        g_new = copy.copy(g)
+        if not print_ctr%50:
+            print(t)
+        print_ctr += 1
 
         # First Step
-        q_new = 0.25*(g_new.get_q_inner(shift='top') + 
-                      g_new.get_q_inner(shift='right') +
-                      g_new.get_q_inner(shift='bottom') +
-                      g_new.get_q_inner(shift='left'))
-        q_new += 0.5*dt/dx * (g.get_F('right') - g.get_F('left') + 
-                              g.get_G('bottom') - g.get_G('top'))
-        g_new.set_q_inner(q_new)
+        # topright (half-step)
+        g_topright = copy.deepcopy(g)
+        q_topright = 0.25 * (g_topright.get_q_inner(shift='top') + 
+                             g_topright.get_q_inner(shift='topright') +
+                             g_topright.get_q_inner(shift='right') +
+                             g_topright.get_q_inner(shift='center'))
+        
+        q_topright -= 0.25*dt/dx * (g.get_F('topright') + g.get_F('right') - 
+                                    g.get_F('top') - g.get_F('center'))
+        q_topright -= 0.25*dt/dy * (g.get_G('right') + g.get_G('center') - 
+                                    g.get_G('top') - g.get_G('topright'))
+        
+        g_topright.set_q_inner(q_topright)
+
+        # topleft (half-step)
+        g_topleft = copy.deepcopy(g)
+        q_topleft = 0.25 * (g_topleft.get_q_inner(shift='top') +
+                             g_topleft.get_q_inner(shift='topleft') +
+                             g_topleft.get_q_inner(shift='left') +
+                             g_topleft.get_q_inner(shift='center'))
+
+        q_topleft -= 0.25*dt/dx * (g.get_F('top') + g.get_F('center') -
+                                   g.get_F('topleft') - g.get_F('left'))
+        q_topleft -= 0.25*dt/dy * (g.get_G('left') + g.get_G('center') -
+                                   g.get_G('topleft') - g.get_G('top'))
+        
+        g_topleft.set_q_inner(q_topleft)
+
+        # bottomleft (half-step)
+        g_bottomleft = copy.deepcopy(g)
+        q_bottomleft = 0.25 * (g_bottomleft.get_q_inner(shift='bottom') +
+                             g_bottomleft.get_q_inner(shift='bottomleft') +
+                             g_bottomleft.get_q_inner(shift='left') +
+                             g_bottomleft.get_q_inner(shift='center'))
+
+        q_bottomleft -= 0.25*dt/dx * (g.get_F('bottom') + g.get_F('center') -
+                                      g.get_F('bottomleft') - g.get_F('left'))
+        q_bottomleft -= 0.25*dt/dy * (g.get_G('bottom') + g.get_G('bottomleft') -
+                                      g.get_G('left') - g.get_G('center'))
+
+        g_bottomleft.set_q_inner(q_bottomleft)
+
+        # bottomright (half-step)
+        g_bottomright = copy.deepcopy(g)
+        q_bottomright = 0.25 * (g_bottomright.get_q_inner(shift='bottom') +
+                             g_bottomright.get_q_inner(shift='bottomright') +
+                             g_bottomright.get_q_inner(shift='right') +
+                             g_bottomright.get_q_inner(shift='center'))
+
+        q_bottomright -= 0.25*dt/dx * (g.get_F('bottomright') + g.get_F('right') -
+                                       g.get_F('center') - g.get_F('bottom'))
+        q_bottomright -= 0.25*dt/dy * (g.get_G('bottom') + g.get_G('bottomright') -
+                                       g.get_G('right') - g.get_G('center'))
+
+        g_bottomright.set_q_inner(q_bottomright)
 
         # Second Step
-        g.set_q_inner(g.get_q_inner() - 
-                        dt/dx * (g_new.get_F('right') - g_new.get_F('left') + 
-                                 g_new.get_G('bottom') - g_new.get_G('top')))
+        g.set_q_inner(g.get_q_inner('center') -
+                        0.5*dt/dx * (g_topright.get_F('center') + g_bottomright.get_F('center') -
+                                       g_topleft.get_F('center') - g_bottomleft.get_F('center')) -
+                        0.5*dt/dy * (g_bottomleft.get_G('center') + g_bottomright.get_G('center') -
+                                       g_topleft.get_G('center') - g_topright.get_G('center')))
 
         g.enforce_periodic_bc()
 
-        # mpl_img = ax.imshow(g.get_rho_u() / g.get_rho(), animated=True, interpolation='none')
+        mpl_img = ax.pcolormesh(g.get_p())#, animated=True, interpolation='none')
+        ax.set_aspect('equal')
 
         # Append currenst state as frame animation list
-        # img_list.append([mpl_img])
+        # if not print_ctr%20:
+        #     img_list.append([mpl_img])
+        img_list.append([mpl_img])
+        # if t > 100*dt:
+        #     break
+        # if np.isclose(t,1*dt):
+        #     ax.imshow(g.get_p())
+        #     plt.show()
 
         t += dt
 
     # ax.imshow(g.get_p_inner())
     # ax.quiver(xx_spacing, yy_spacing, u, v)
 
-    # ani = animation.ArtistAnimation(fig, img_list, interval=50, blit=True,
-    #                             repeat_delay=1000)
+    ani = animation.ArtistAnimation(fig, img_list, interval=15, blit=True,
+                                repeat_delay=1000)
 
     # Save frames as movie
-    # writer = animation.FFMpegWriter(
-    #     fps=40, metadata=dict(artist='Me'), bitrate=200)
-    # ani.save("figures/movie.mp4", writer=writer, dpi=100)
-    ax.imshow(g.get_rho_u())
+    writer = animation.FFMpegWriter(
+        fps=25, metadata=dict(artist='Me'), bitrate=120)
+    ani.save("figures/movie.mp4", writer=writer, dpi=80)
+    # ax.imshow(g.get_rho_u())
 
     plt.show()
 
