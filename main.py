@@ -3,6 +3,23 @@ import copy
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+class Logger:
+    def __init__(self, header, initial_value=None):
+        self.header = header
+        self.states = []
+        if initial_value is not None:
+            self.states.append(initial_value)
+
+    def log(self, new_state):
+        self.states.append(new_state)
+
+    def collect(self):
+        return np.asarray(self.states)
+
+    def save(self, filename):
+        np.savetxt(filename, np.stack(self.states), delimiter=',', header=self.header, comments='')
 
 def isentropic_vortex_ic(xx_spacing, yy_spacing, gamma, epsilon):
     r_grid = np.sqrt((xx_spacing)**2 + (yy_spacing)**2)
@@ -20,14 +37,17 @@ def isentropic_vortex_ic(xx_spacing, yy_spacing, gamma, epsilon):
         if r < 0.2:
             return p_0 + 12.5*r*r
         elif r < 0.4:
-            return p_0 + 4.0*np.log(5*r) + 4.0 - 20.0*r + 12.5*r*r
+            return p_0 + 4.0*np.log(5.0*r) + 4.0 - 20.0*r + 12.5*r*r
         else:
             return p_0 + 4.0*np.log(2.0) - 2.0
 
-    v_phi = np.vectorize(v_init)(r_grid)
+    vel_phi = np.vectorize(v_init)(r_grid)
     p = np.vectorize(p_init)(r_grid)
 
-    return np.multiply(v_phi, xx_spacing), np.multiply(v_phi, yy_spacing), p
+    u_phi = -vel_phi * yy_spacing / r_grid
+    v_phi = vel_phi * xx_spacing / r_grid
+
+    return u_phi, v_phi, p
 
 def total_cell_energy(p, velocity, rho, gamma):
     vel_norm = np.linalg.norm(velocity, axis=-1)
@@ -76,6 +96,9 @@ class Grid:
 
         self.dim_tot = cells_per_dim + 2*self.hs
         self.gamma = gamma
+
+        # Logging
+        self.logger = Logger(header='rho, u, v, e, p')
 
         # Enforce initial conditions
         u_init, v_init, p_init = isentropic_vortex_ic(xx_spacing,
@@ -192,6 +215,16 @@ class Grid:
         self.p[:self.hs, :] = self.p[-self.ds:-self.hs, :]
         self.p[-self.hs:,:] = left_p
 
+    def avg_grid_vals(self):
+        u, v, e, p = primitive_vars(self.get_q_inner(), self.gamma)
+        rho = self.get_rho_inner()
+        state = np.stack([rho, u, v, e, p], axis=-1)
+        avg_state = np.mean(state.reshape(-1, 5), axis=0)
+        return avg_state
+
+    def log_mean_state(self, time):
+        self.logger.log(np.insert(self.avg_grid_vals(), 0, time))
+
 
 def main():
     # Adiabatic exponent
@@ -199,7 +232,7 @@ def main():
     epsilon = 1e-2
 
     # CFL Number
-    cfl = 0.95
+    cfl = 0.45
 
     x_range = [0.0, 1.0]
     y_range = [0.0, 1.0]
@@ -213,7 +246,7 @@ def main():
 
     # Evolution with 2D Richtmyer scheme
     t = 0.0
-    t_end = 0.1
+    t_end = 2.0
 
     # Satisfy CFL condition
     rho = g.get_rho_inner()
@@ -229,11 +262,30 @@ def main():
     img_list = []
     fig, ax = plt.subplots()
 
+    # I like to position my colorbars this way, but you don't have to
+    div = make_axes_locatable(ax)
+    cax = div.append_axes('right', '5%', '5%')
+
+    # Set up gridpoint coordinates
+    # x_spacing = np.linspace(*x_range, cells_per_dim)
+    # y_spacing = np.linspace(*y_range, cells_per_dim)
+    #
+    # # Create centered coordinate system
+    # xx_spacing, yy_spacing = np.meshgrid(x_spacing, y_spacing)
+    # xx_spacing -= 0.5
+    # yy_spacing -= 0.5
+    # ax.quiver(xx_spacing, yy_spacing, u, v)
+    # ax.imshow(rho)
+    # plt.show()
+
     print_ctr = 0
+    tot_steps = int((t_end - t)/dt)
+    frame_every = 50
+    create_movie = True
     while t < t_end:
-        if not print_ctr%50:
-            print(t)
-        print_ctr += 1
+        # Log current mean state
+        if create_movie and not print_ctr%frame_every:
+            g.log_mean_state(time=t)
 
         # First Step
         # topright (half-step)
@@ -301,32 +353,51 @@ def main():
 
         g.enforce_periodic_bc()
 
-        mpl_img = ax.pcolormesh(g.get_p())#, animated=True, interpolation='none')
-        ax.set_aspect('equal')
+        # mpl_img = ax.pcolormesh(g.get_e())#, animated=True, interpolation='none')
+        # ax.set_aspect('equal')
+        if create_movie and not print_ctr%frame_every:
+            img_list.append(copy.copy(g.get_rho()))
 
         # Append currenst state as frame animation list
         # if not print_ctr%20:
         #     img_list.append([mpl_img])
-        img_list.append([mpl_img])
+        # img_list.append([mpl_img])
         # if t > 100*dt:
         #     break
         # if np.isclose(t,1*dt):
         #     ax.imshow(g.get_p())
         #     plt.show()
+        if not print_ctr%200:
+            print(t)
+        print_ctr += 1
 
         t += dt
 
-    # ax.imshow(g.get_p_inner())
-    # ax.quiver(xx_spacing, yy_spacing, u, v)
+    # ax.imshow(g.get_rho())
 
-    ani = animation.ArtistAnimation(fig, img_list, interval=15, blit=True,
-                                repeat_delay=1000)
+    # # Save frames as movie
+    vmax_tot = np.max(np.asarray(img_list))
+    vmin_tot = np.min(np.asarray(img_list))
 
-    # Save frames as movie
+    im = ax.imshow(img_list[0], vmin=vmax_tot, vmax=vmax_tot)#, animated=True, interpolation='none')
+    cb = fig.colorbar(im, cax=cax)
+    ax.set_aspect('equal')
+
+    print(len(img_list))
+
+    def animate(i):
+        arr = img_list[i]
+        im.set_data(arr)
+        im.set_clim(vmin_tot, vmax_tot)
+        return im
+
+    ani = animation.FuncAnimation(fig, animate, interval=20, frames=len(img_list))
     writer = animation.FFMpegWriter(
-        fps=25, metadata=dict(artist='Me'), bitrate=120)
-    ani.save("figures/movie.mp4", writer=writer, dpi=80)
-    # ax.imshow(g.get_rho_u())
+        fps=25, metadata=dict(artist='Me'), bitrate=200)
+    ani.save("figures/movie.mp4", writer=writer, dpi=100)
+
+    # log statistics
+    g.logger.save('logging/test.csv')
 
     plt.show()
 
