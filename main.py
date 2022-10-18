@@ -23,6 +23,26 @@ class Logger:
 
 def isentropic_vortex_ic(xx_spacing, yy_spacing, gamma, epsilon):
     r_grid = np.sqrt((xx_spacing)**2 + (yy_spacing)**2)
+
+    def v_init(r):
+        return 5.0 / (2*np.pi) * np.exp(0.5 * (1.0 - r*r))
+
+    def p_init(r):
+        dT = - (gamma - 1.0) * 25.0 / (8*gamma*np.pi**2) * np.exp(1.0 - r*r)
+        T = 1 + dT
+        dens = T ** (1/(gamma - 1.0))
+        return dens**gamma
+
+    vel_phi = np.vectorize(v_init)(r_grid)
+    p = np.vectorize(p_init)(r_grid)
+
+    u_phi = -vel_phi * yy_spacing + 1.0
+    v_phi = vel_phi * xx_spacing + 1.0
+
+    return u_phi, v_phi, p, p**(1.0/gamma)
+
+def incompressible_vortex_ic(xx_spacing, yy_spacing, gamma, epsilon):
+    r_grid = np.sqrt((xx_spacing)**2 + (yy_spacing)**2)
     p_0 = 1.0 / (gamma * epsilon * epsilon) - 0.5
 
     def v_init(r):
@@ -43,15 +63,27 @@ def isentropic_vortex_ic(xx_spacing, yy_spacing, gamma, epsilon):
 
     vel_phi = np.vectorize(v_init)(r_grid)
     p = np.vectorize(p_init)(r_grid)
+    print(np.any(r_grid == 0.0))
+    print(r_grid.max())
 
-    u_phi = -vel_phi * yy_spacing / r_grid
-    v_phi = vel_phi * xx_spacing / r_grid
+    float_eps = 1e-20
+    r2_grid = r_grid**2
+    # Avoid division by zero around origin
+    u_phi = -vel_phi * yy_spacing * r_grid / (r2_grid + float_eps)
+    v_phi = vel_phi * xx_spacing * r_grid / (r2_grid + float_eps)
+    
+    rho = np.ones_like(u_phi)
 
-    return u_phi, v_phi, p
+    return u_phi, v_phi, p, rho
 
 def total_cell_energy(p, velocity, rho, gamma):
     vel_norm = np.linalg.norm(velocity, axis=-1)
     return p / (gamma - 1.0) + 0.5 * np.multiply(rho, vel_norm**2)
+
+def compact_vorticity(topleft, topright, bottomleft, bottomright):
+    x_dir = 0.5 * (bottomright[..., 1] + bottomleft[..., 1] - topright[..., 1] - topleft[..., 1])
+    y_dir = 0.5 * (bottomright[..., 2] + topright[..., 2] - bottomleft[..., 2] - topleft[..., 2])
+    return y_dir - x_dir
 
 def primitive_vars(q, gamma):
     u = q[..., 1]/q[..., 0]
@@ -84,8 +116,14 @@ class Grid:
 
         # Create centered coordinate system
         xx_spacing, yy_spacing = np.meshgrid(x_spacing, y_spacing)
-        xx_spacing -= 0.5
-        yy_spacing -= 0.5
+        if (x_range[0] <= 0.0 and x_range[1] >= 0):
+            x_offset = (x_range[1] - x_range[0]) / 2.0
+            x_offset += x_range[0]
+            xx_spacing -= x_offset
+        if (y_range[0] <= 0.0 and y_range[1] >= 0):
+            y_offset = (y_range[1] - y_range[0]) / 2.0
+            y_offset += y_range[0]
+            yy_spacing -= y_offset
 
         # Index helpers for shifted grids
         self.ds = 2*halo_size
@@ -98,14 +136,13 @@ class Grid:
         self.gamma = gamma
 
         # Logging
-        self.logger = Logger(header='rho, u, v, e, p')
+        self.logger = Logger(header='t, zeta, rho, u, v, e, p')
 
         # Enforce initial conditions
-        u_init, v_init, p_init = isentropic_vortex_ic(xx_spacing,
+        u_init, v_init, p_init, rho_init = incompressible_vortex_ic(xx_spacing,
                                                       yy_spacing,
                                                       gamma,
                                                       epsilon)
-        rho_init = np.ones_like(u_init)
         velocity = np.stack([u_init, v_init], axis=-1)
         e_init = total_cell_energy(p_init, velocity, rho_init, gamma)
 
@@ -116,8 +153,8 @@ class Grid:
         # System state
         self.q[self.center_idx, 
                self.center_idx] = np.stack([rho_init,
-                                            u_init,
-                                            v_init,
+                                            rho_init*u_init,
+                                            rho_init*v_init,
                                             e_init], axis=-1)
 
         # Enforce b.c.
@@ -198,22 +235,29 @@ class Grid:
         self.p[self.center_idx, self.center_idx] = p
 
         # x-dim
-        bottom_bdry = self.q[:, self.hs:self.ds, :]
         self.q[:, :self.hs, :] = self.q[:, -self.ds:-self.hs, :]
-        self.q[:, -self.hs:, :] = bottom_bdry
+        self.q[:, -self.hs:, :] = self.q[:, self.hs:self.ds, :]
 
-        bottom_p = self.p[:, self.hs:self.ds]
         self.p[:, :self.hs] = self.p[:, -self.ds:-self.hs]
-        self.p[:,-self.hs:] = bottom_p
+        self.p[:,-self.hs:] = self.p[:, self.hs:self.ds]
         
         # y-dim
-        left_bdry = self.q[self.hs:self.ds, :, :]
         self.q[:self.hs, :] = self.q[-self.ds:-self.hs, :,:]
-        self.q[-self.hs, :] = left_bdry
+        self.q[-self.hs, :] = self.q[self.hs:self.ds, :, :]
         
-        left_p = self.p[self.hs:self.ds, :]
         self.p[:self.hs, :] = self.p[-self.ds:-self.hs, :]
-        self.p[-self.hs:,:] = left_p
+        self.p[-self.hs:,:] = self.p[self.hs:self.ds, :]
+
+        # Corner cells
+        self.q[:self.hs, :self.hs, :] = self.q[-self.ds:-self.hs,
+                                               -self.ds:-self.hs, :]
+        self.q[-self.hs:, -self.hs:, :] = self.q[self.hs:self.ds,
+                                                 self.hs:self.ds, :]
+
+        self.q[:self.hs, -self.hs:, :] = self.q[-self.ds:-self.hs,
+                                                self.hs:self.ds, :]
+        self.q[-self.hs:, :self.hs, :] = self.q[self.hs:self.ds,
+                                                -self.ds:-self.hs, :]
 
     def avg_grid_vals(self):
         u, v, e, p = primitive_vars(self.get_q_inner(), self.gamma)
@@ -222,22 +266,30 @@ class Grid:
         avg_state = np.mean(state.reshape(-1, 5), axis=0)
         return avg_state
 
-    def log_mean_state(self, time):
-        self.logger.log(np.insert(self.avg_grid_vals(), 0, time))
+    def log_mean_state(self, time, **kwargs):
+        state = np.insert(self.avg_grid_vals(), 0, time)
+        for val in kwargs.values():
+            state = np.insert(state, 1, val)
+        self.logger.log(state)
 
 
 def main():
+    fig, ax = plt.subplots()
+
     # Adiabatic exponent
     gamma = 1.4
     epsilon = 1e-2
 
     # CFL Number
-    cfl = 0.45
+    cfl = 0.8
 
+    # x_range = [5.0, 5.0]
+    # y_range = [5.0, 5.0]
+    
     x_range = [0.0, 1.0]
     y_range = [0.0, 1.0]
 
-    cells_per_dim = 50
+    cells_per_dim = 75
     halo_size = 1
     dx = (x_range[1] - x_range[0]) / cells_per_dim
     dy = (y_range[1] - y_range[0]) / cells_per_dim
@@ -246,7 +298,7 @@ def main():
 
     # Evolution with 2D Richtmyer scheme
     t = 0.0
-    t_end = 2.0
+    t_end = 0.1
 
     # Satisfy CFL condition
     rho = g.get_rho_inner()
@@ -260,33 +312,16 @@ def main():
     print(f'dt = {dt}')
 
     img_list = []
-    fig, ax = plt.subplots()
 
     # I like to position my colorbars this way, but you don't have to
     div = make_axes_locatable(ax)
     cax = div.append_axes('right', '5%', '5%')
-
-    # Set up gridpoint coordinates
-    # x_spacing = np.linspace(*x_range, cells_per_dim)
-    # y_spacing = np.linspace(*y_range, cells_per_dim)
-    #
-    # # Create centered coordinate system
-    # xx_spacing, yy_spacing = np.meshgrid(x_spacing, y_spacing)
-    # xx_spacing -= 0.5
-    # yy_spacing -= 0.5
-    # ax.quiver(xx_spacing, yy_spacing, u, v)
-    # ax.imshow(rho)
-    # plt.show()
 
     print_ctr = 0
     tot_steps = int((t_end - t)/dt)
     frame_every = 50
     create_movie = True
     while t < t_end:
-        # Log current mean state
-        if create_movie and not print_ctr%frame_every:
-            g.log_mean_state(time=t)
-
         # First Step
         # topright (half-step)
         g_topright = copy.deepcopy(g)
@@ -294,13 +329,6 @@ def main():
                              g_topright.get_q_inner(shift='topright') +
                              g_topright.get_q_inner(shift='right') +
                              g_topright.get_q_inner(shift='center'))
-        
-        q_topright -= 0.25*dt/dx * (g.get_F('topright') + g.get_F('right') - 
-                                    g.get_F('top') - g.get_F('center'))
-        q_topright -= 0.25*dt/dy * (g.get_G('right') + g.get_G('center') - 
-                                    g.get_G('top') - g.get_G('topright'))
-        
-        g_topright.set_q_inner(q_topright)
 
         # topleft (half-step)
         g_topleft = copy.deepcopy(g)
@@ -309,26 +337,12 @@ def main():
                              g_topleft.get_q_inner(shift='left') +
                              g_topleft.get_q_inner(shift='center'))
 
-        q_topleft -= 0.25*dt/dx * (g.get_F('top') + g.get_F('center') -
-                                   g.get_F('topleft') - g.get_F('left'))
-        q_topleft -= 0.25*dt/dy * (g.get_G('left') + g.get_G('center') -
-                                   g.get_G('topleft') - g.get_G('top'))
-        
-        g_topleft.set_q_inner(q_topleft)
-
         # bottomleft (half-step)
         g_bottomleft = copy.deepcopy(g)
         q_bottomleft = 0.25 * (g_bottomleft.get_q_inner(shift='bottom') +
                              g_bottomleft.get_q_inner(shift='bottomleft') +
                              g_bottomleft.get_q_inner(shift='left') +
                              g_bottomleft.get_q_inner(shift='center'))
-
-        q_bottomleft -= 0.25*dt/dx * (g.get_F('bottom') + g.get_F('center') -
-                                      g.get_F('bottomleft') - g.get_F('left'))
-        q_bottomleft -= 0.25*dt/dy * (g.get_G('bottom') + g.get_G('bottomleft') -
-                                      g.get_G('left') - g.get_G('center'))
-
-        g_bottomleft.set_q_inner(q_bottomleft)
 
         # bottomright (half-step)
         g_bottomright = copy.deepcopy(g)
@@ -337,11 +351,34 @@ def main():
                              g_bottomright.get_q_inner(shift='right') +
                              g_bottomright.get_q_inner(shift='center'))
 
+        # Compute vorticity
+        if create_movie and not print_ctr%frame_every:
+            vorticity = compact_vorticity(q_topleft, q_topright, q_bottomleft, q_bottomright)
+
+        # Evolve half timestep
+        q_topright -= 0.25*dt/dx * (g.get_F('topright') + g.get_F('right') - 
+                                    g.get_F('top') - g.get_F('center'))
+        q_topright -= 0.25*dt/dy * (g.get_G('right') + g.get_G('center') - 
+                                    g.get_G('top') - g.get_G('topright'))
+        
+        q_topleft -= 0.25*dt/dx * (g.get_F('top') + g.get_F('center') -
+                                   g.get_F('topleft') - g.get_F('left'))
+        q_topleft -= 0.25*dt/dy * (g.get_G('left') + g.get_G('center') -
+                                   g.get_G('topleft') - g.get_G('top'))
+        
+        q_bottomleft -= 0.25*dt/dx * (g.get_F('bottom') + g.get_F('center') -
+                                      g.get_F('bottomleft') - g.get_F('left'))
+        q_bottomleft -= 0.25*dt/dy * (g.get_G('bottom') + g.get_G('bottomleft') -
+                                      g.get_G('left') - g.get_G('center'))
+
         q_bottomright -= 0.25*dt/dx * (g.get_F('bottomright') + g.get_F('right') -
                                        g.get_F('center') - g.get_F('bottom'))
         q_bottomright -= 0.25*dt/dy * (g.get_G('bottom') + g.get_G('bottomright') -
                                        g.get_G('right') - g.get_G('center'))
 
+        g_topright.set_q_inner(q_topright)
+        g_topleft.set_q_inner(q_topleft)
+        g_bottomleft.set_q_inner(q_bottomleft)
         g_bottomright.set_q_inner(q_bottomright)
 
         # Second Step
@@ -353,27 +390,21 @@ def main():
 
         g.enforce_periodic_bc()
 
-        # mpl_img = ax.pcolormesh(g.get_e())#, animated=True, interpolation='none')
-        # ax.set_aspect('equal')
         if create_movie and not print_ctr%frame_every:
+            # Append currenst state as frame animation list
             img_list.append(copy.copy(g.get_rho()))
 
-        # Append currenst state as frame animation list
-        # if not print_ctr%20:
-        #     img_list.append([mpl_img])
-        # img_list.append([mpl_img])
-        # if t > 100*dt:
-        #     break
-        # if np.isclose(t,1*dt):
-        #     ax.imshow(g.get_p())
-        #     plt.show()
+            # Log vorticity together with primitive variables
+            mean_vorticity = np.mean(vorticity)
+            print(mean_vorticity)
+            g.log_mean_state(time=t, vorticity=mean_vorticity)
+
         if not print_ctr%200:
             print(t)
         print_ctr += 1
 
         t += dt
 
-    # ax.imshow(g.get_rho())
 
     # # Save frames as movie
     vmax_tot = np.max(np.asarray(img_list))
